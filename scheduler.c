@@ -1,50 +1,12 @@
-/* ======================================================================
- * scheduler.c
- * Tugas 2 Sistem Operasi - Multilevel Feedback Queue (MLFQ) Scheduler
- * Fakultas Ilmu Komputer, Universitas Indonesia - Gasal 2026/2027
- *
- * Kelompok : <KELAS><KELOMPOK>
- * Anggota  : <isi nama & bagian masing-masing>
- *
- * Konfigurasi MLFQ:
- *   Q0 : Round Robin (quantum dari input)  - prioritas tertinggi
- *   Q1 : Round Robin (quantum dari input)
- *   Q2 : FCFS                              - prioritas terendah
- *
- * Aturan:
- *   1. Proses baru selalu masuk ke ekor Q0.
- *   2. CPU selalu diberikan ke kepala queue tertinggi yang tidak kosong.
- *   3. Jika quantum habis dan proses belum selesai -> turun satu level
- *      (Q0 -> Q1 -> Q2). Q2 FCFS tidak punya quantum.
- *   4. Jika ada proses READY di queue yang lebih tinggi daripada proses
- *      yang sedang RUNNING, proses tsb di-preempt dan kembali ke ekor
- *      queue-nya sendiri (level tidak turun, hitungan quantum di-reset).
- *   5. (Opsional) Priority boost: tiap S time unit semua proses di Q1/Q2
- *      dinaikkan ke Q0 untuk mencegah starvation.
- *
- * Simulasi berjalan per 1 time unit (tick). Tidak ada simulasi I/O,
- * sehingga state BLOCKED didefinisikan tetapi tidak pernah dipakai.
- *
- * Kompilasi : gcc -std=c99 -Wall -o scheduler scheduler.c
- * ====================================================================== */
-
+/*
+ * Bagian 3, 4, 5 - Scheduling Table, Rata-rata, CPU Util & Throughput
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define LINE "======================================================================="
 #define DASH "-----------------------------------------------------------------------"
-
-#define NUM_QUEUES    3     /* Q0 (RR), Q1 (RR), Q2 (FCFS) */
-#define MAX_PROCESS   20
-#define MAX_ARRIVAL   1000
-#define MAX_BURST     100
-#define MAX_QUANTUM   50
-#define MIN_BOOST     10    /* boost minimal tiap 10 time unit agar log tidak meledak */
-
-/* ======================================================================
- * PCB (Process Control Block)
- * ====================================================================== */
 
 typedef enum {
     NEW,
@@ -74,21 +36,24 @@ typedef struct {
     int response_time;
 } PCB;
 
-/* ======================================================================
- * BAGIAN 7 + OUTPUT KHUSUS MLFQ (state log, migrasi, preemption)
- * ====================================================================== */
+/*
+ * BAGIAN 7 DAN OUTPUT KHUSUS MLFQ
+ *
+ * Tempel bagian ini SETELAH definisi ProcessState dan PCB di scheduler.c.
+ * Tidak ada main(), input, queue, atau loop scheduler di file ini.
+ */
 
-/* Kapasitas log dihitung dari batas input (20 proses, BT <= 100, AT <= 1000,
- * boost minimal tiap 10). Kasus terberat (q=1, boost tiap 10) butuh sekitar
- * 6000 state log, 4000 migrasi, dan 2000 slice. Nilai di bawah memberi
- * cadangan agar log tidak pernah penuh untuk input yang lolos validasi. */
-#define MAX_STATE_LOG 12000
-#define MAX_MIGRATION_LOG 8000
+#define MAX_STATE_LOG 1000
+#define MAX_MIGRATION_LOG 500
 #define MAX_PREEMPTION_LOG 500
 
-/* Struct berikut BUKAN pengganti PCB. PCB hanya menyimpan state dan queue
- * proses saat ini; kalau state berubah, nilai lama tertimpa. Karena itu
- * riwayat disimpan di log terpisah. */
+/* ======================== DATA HISTORY =========================
+ * Struct berikut BUKAN pengganti PCB. Struct ini hanya menyimpan riwayat
+ * yang dibutuhkan oleh output bagian 7 dan output khusus MLFQ.
+ *
+ * PCB hanya menyimpan state dan queue proses saat ini. Kalau state berubah,
+ * nilai lama di PCB tertimpa. Karena itu, diperlukan log terpisah.
+ */
 
 /* Menyimpan satu perubahan state milik sebuah proses. */
 typedef struct {
@@ -98,16 +63,13 @@ typedef struct {
     int queue_level;
 } StateLog;
 
-/* Menyimpan perpindahan proses dari satu queue ke queue lain.
- * is_boost = 0 : turun karena quantum habis
- * is_boost = 1 : naik ke Q0 karena priority boost */
+/* Menyimpan perpindahan proses dari satu queue ke queue lain. */
 typedef struct {
     int pid;
     int from_queue;
     int to_queue;
     int time;
     int remaining_time;
-    int is_boost;
 } MigrationLog;
 
 /* Menyimpan hasil preemption oleh queue yang lebih tinggi. */
@@ -147,8 +109,15 @@ const char *process_state_name(ProcessState state) {
     }
 }
 
-/* Catat state terbaru proses ke history (dipanggil SETELAH field state
- * di PCB diperbarui): datang, dapat CPU, dipreempt, quantum habis, selesai. */
+/*
+ * Catat state terbaru proses ke history tanpa mengubah isi PCB.
+ * Fungsi dipanggil oleh scheduler setelah field state diperbarui, saat:
+ * - proses datang                 : NEW -> READY
+ * - proses mendapat CPU          : READY -> RUNNING
+ * - proses dipreempt             : RUNNING -> READY
+ * - proses menunggu I/O (jika ada): RUNNING -> BLOCKED
+ * - proses selesai               : RUNNING -> TERMINATED
+ */
 void record_process_state(const PCB *process, int time) {
     if (state_log_count >= MAX_STATE_LOG) {
         printf("State log penuh.\n");
@@ -162,8 +131,15 @@ void record_process_state(const PCB *process, int time) {
     state_log_count++;
 }
 
-static void add_migration(const PCB *process, int source_queue,
-                          int destination_queue, int time, int is_boost) {
+/*
+ * Catat perpindahan queue tanpa mengubah queue_level atau state di PCB.
+ * Scheduler memanggil fungsi ini ketika quantum Q0 atau Q1 habis dan proses
+ * belum selesai, sebelum/ketika proses dipindahkan ke queue tujuan.
+ */
+void record_queue_migration(const PCB *process,
+                            int source_queue,
+                            int destination_queue,
+                            int time) {
     if (migration_log_count >= MAX_MIGRATION_LOG) {
         printf("Migration log penuh.\n");
         return;
@@ -175,25 +151,13 @@ static void add_migration(const PCB *process, int source_queue,
     migration_logs[migration_log_count].time = time;
     migration_logs[migration_log_count].remaining_time =
         process->remaining_time;
-    migration_logs[migration_log_count].is_boost = is_boost;
     migration_log_count++;
 }
 
-/* Catat proses turun queue karena quantum Q0/Q1 habis. */
-void record_queue_migration(const PCB *process,
-                            int source_queue,
-                            int destination_queue,
-                            int time) {
-    add_migration(process, source_queue, destination_queue, time, 0);
-}
-
-/* Catat proses naik ke Q0 karena priority boost. */
-void record_boost_migration(const PCB *process, int source_queue, int time) {
-    add_migration(process, source_queue, 0, time, 1);
-}
-
-/* Catat jika proses pada queue rendah dihentikan karena ada proses READY
- * pada queue yang lebih tinggi. Preemption tidak mengubah queue_level. */
+/*
+ * Catat jika proses pada queue rendah dihentikan karena ada proses READY
+ * pada queue yang lebih tinggi. Preemption tidak mengubah queue_level.
+ */
 void record_higher_queue_preemption(const PCB *stopped,
                                     const PCB *incoming,
                                     int time) {
@@ -258,10 +222,9 @@ void print_process_queue_movements(const PCB processes[], int n) {
 
         for (int j = 0; j < migration_log_count; j++) {
             if (migration_logs[j].pid == processes[i].pid) {
-                printf(" -> Q%d (t=%d%s)",
+                printf(" -> Q%d (t=%d)",
                        migration_logs[j].to_queue,
-                       migration_logs[j].time,
-                       migration_logs[j].is_boost ? ", boost" : "");
+                       migration_logs[j].time);
             }
         }
 
@@ -278,8 +241,6 @@ void print_process_queue_movements(const PCB processes[], int n) {
 
 /* Output Khusus MLFQ: tampilkan detail setiap perpindahan queue. */
 void print_queue_migrations(void) {
-    int demotions = 0, boosts = 0;
-
     printf("%s\n", LINE);
     printf("QUEUE MIGRATIONS\n");
     printf("%s\n", LINE);
@@ -289,32 +250,18 @@ void print_queue_migrations(void) {
     }
 
     for (int i = 0; i < migration_log_count; i++) {
-        if (migration_logs[i].is_boost) {
-            printf("t=%d : P%d Q%d -> Q%d (priority boost; sisa BT=%d)\n",
-                   migration_logs[i].time,
-                   migration_logs[i].pid,
-                   migration_logs[i].from_queue,
-                   migration_logs[i].to_queue,
-                   migration_logs[i].remaining_time);
-            boosts++;
-        } else {
-            printf("t=%d : P%d Q%d -> Q%d "
-                   "(quantum Q%d habis; sisa BT=%d)\n",
-                   migration_logs[i].time,
-                   migration_logs[i].pid,
-                   migration_logs[i].from_queue,
-                   migration_logs[i].to_queue,
-                   migration_logs[i].from_queue,
-                   migration_logs[i].remaining_time);
-            demotions++;
-        }
+        printf("t=%d : P%d Q%d -> Q%d "
+               "(quantum Q%d habis; sisa BT=%d)\n",
+               migration_logs[i].time,
+               migration_logs[i].pid,
+               migration_logs[i].from_queue,
+               migration_logs[i].to_queue,
+               migration_logs[i].from_queue,
+               migration_logs[i].remaining_time);
     }
 
-    printf("Total Queue Migration : %d", migration_log_count);
-    if (boosts > 0) {
-        printf(" (turun: %d, boost: %d)", demotions, boosts);
-    }
-    printf("\n%s\n\n", LINE);
+    printf("Total Queue Migration : %d\n", migration_log_count);
+    printf("%s\n\n", LINE);
 }
 
 /* Output Khusus MLFQ: tampilkan preemption antarqueue. */
@@ -344,8 +291,19 @@ void print_higher_queue_preemptions(void) {
 }
 
 /* ============================================================
- * BAGIAN 5A - READY QUEUE (LINKED LIST)
+ * BAGIAN 5 - READY QUEUE (LINKED LIST), MENU INPUT + 5 SKENARIO,
+ *            PRIORITY BOOST (OPSIONAL)
  * ============================================================ */
+
+#define NUM_QUEUES    3     /* Q0 (RR), Q1 (RR), Q2 (FCFS) */
+#define MAX_PROCESS   20
+#define MAX_ARRIVAL   1000
+#define MAX_BURST     100
+#define MAX_QUANTUM   50
+#define MIN_BOOST     10    /* interval boost minimal, agar log boost cukup */
+#define MAX_BOOST_LOG 4000
+
+/* ---------------- READY QUEUE (LINKED LIST) ---------------- */
 
 /* Satu node linked list. Node hanya MENUNJUK ke PCB asli (bukan salinan),
  * jadi perubahan remaining_time dll. langsung terlihat di array proses. */
@@ -359,7 +317,6 @@ typedef struct QueueNode {
 typedef struct {
     QueueNode *head;
     QueueNode *tail;
-    int count;
     int level;    /* 0 = prioritas tertinggi */
     int quantum;  /* 0 berarti FCFS (tidak ada quantum) */
 } ReadyQueue;
@@ -369,14 +326,6 @@ typedef struct {
     int quantum[NUM_QUEUES];  /* quantum[2] selalu 0 karena Q2 = FCFS */
     int boost_interval;       /* 0 = priority boost tidak aktif */
 } MLFQConfig;
-
-void queue_init(ReadyQueue *q, int level, int quantum) {
-    q->head = NULL;
-    q->tail = NULL;
-    q->count = 0;
-    q->level = level;
-    q->quantum = quantum;
-}
 
 int queue_is_empty(const ReadyQueue *q) {
     return q->head == NULL;
@@ -400,7 +349,6 @@ void queue_enqueue(ReadyQueue *q, PCB *process) {
         q->tail->next = node;
         q->tail = node;
     }
-    q->count++;
     process->queue_level = q->level;
 }
 
@@ -418,39 +366,22 @@ PCB *queue_dequeue(ReadyQueue *q) {
         q->tail = NULL;
     }
     free(node);
-    q->count--;
     return process;
 }
 
-/* Lihat proses terdepan tanpa mengeluarkannya. */
+/* Lihat proses terdepan tanpa mengeluarkannya
+ * (dipakai untuk mencatat proses yang mem-preempt). */
 PCB *queue_peek(const ReadyQueue *q) {
     return q->head == NULL ? NULL : q->head->process;
 }
 
-/* Kosongkan queue dan bebaskan semua node. */
-void queue_clear(ReadyQueue *q) {
-    while (queue_dequeue(q) != NULL) {
-    }
-}
-
-/* Cetak isi queue, contoh: Q1 [RR q=3]: P1(sisa=6) -> P2(sisa=2) -> NULL */
-void queue_print(const ReadyQueue *q) {
-    if (q->quantum > 0) {
-        printf("Q%d [RR q=%d]: ", q->level, q->quantum);
-    } else {
-        printf("Q%d [FCFS]  : ", q->level);
-    }
-    for (const QueueNode *n = q->head; n != NULL; n = n->next) {
-        printf("P%d(sisa=%d) -> ", n->process->pid,
-               n->process->remaining_time);
-    }
-    printf("NULL\n");
-}
-
-/* Siapkan Q0, Q1, Q2 sesuai konfigurasi. */
+/* Siapkan Q0, Q1, Q2 kosong sesuai konfigurasi. */
 void mlfq_init_queues(ReadyQueue queues[], const MLFQConfig *cfg) {
     for (int i = 0; i < NUM_QUEUES; i++) {
-        queue_init(&queues[i], i, cfg->quantum[i]);
+        queues[i].head = NULL;
+        queues[i].tail = NULL;
+        queues[i].level = i;
+        queues[i].quantum = cfg->quantum[i];
     }
 }
 
@@ -475,33 +406,42 @@ void mlfq_make_ready(ReadyQueue queues[], PCB *process, int level, int time) {
     record_process_state(process, time);
 }
 
-/* Snapshot isi ketiga queue, berguna untuk trace saat demo. */
-void mlfq_print_queues(const ReadyQueue queues[], int time) {
-    printf("  [t=%d] isi ready queue:\n", time);
-    for (int i = 0; i < NUM_QUEUES; i++) {
-        printf("    ");
-        queue_print(&queues[i]);
-    }
-}
-
 /* Bebaskan semua node yang masih tersisa (panggil di akhir simulasi). */
 void mlfq_free_queues(ReadyQueue queues[]) {
     for (int i = 0; i < NUM_QUEUES; i++) {
-        queue_clear(&queues[i]);
+        while (queue_dequeue(&queues[i]) != NULL) {
+        }
     }
 }
 
-/* ============================================================
- * BAGIAN 5C - PRIORITY BOOST (OPSIONAL)
+/* ---------------- PRIORITY BOOST (OPSIONAL) ----------------
  * Setiap boost_interval time unit, semua proses di Q1 dan Q2 dinaikkan
  * ke Q0. Tujuannya mencegah starvation: tanpa boost, proses di Q2 bisa
- * terus tertunda jika proses baru terus berdatangan ke Q0.
- * ============================================================ */
+ * terus tertunda jika proses baru terus berdatangan ke Q0. */
 
-static int boost_trigger_count = 0;
+/* Satu baris riwayat boost: proses pid naik dari from_queue ke Q0. */
+typedef struct {
+    int time;
+    int pid;
+    int from_queue;
+} BoostLog;
 
+static BoostLog boost_logs[MAX_BOOST_LOG];
+static int boost_log_count = 0;
+
+/* Kosongkan riwayat boost sebelum satu simulasi dimulai. */
 void reset_boost_logs(void) {
-    boost_trigger_count = 0;
+    boost_log_count = 0;
+}
+
+static void record_boost(const PCB *process, int from_queue, int time) {
+    if (boost_log_count >= MAX_BOOST_LOG) {
+        return;
+    }
+    boost_logs[boost_log_count].time = time;
+    boost_logs[boost_log_count].pid = process->pid;
+    boost_logs[boost_log_count].from_queue = from_queue;
+    boost_log_count++;
 }
 
 /* Apakah boost harus dilakukan pada waktu ini? (t=0 tidak dihitung) */
@@ -514,21 +454,19 @@ int boost_due(const MLFQConfig *cfg, int time) {
  * Jika proses yang sedang RUNNING berada di Q1/Q2, level-nya juga jadi 0.
  *
  * Return 1 jika proses RUNNING ikut di-boost. Dalam kasus itu scheduler
- * WAJIB: reset penghitung quantum proses tsb, dan memotong slice Gantt
+ * harus mereset hitungan quantum proses tsb dan memotong slice Gantt
  * (log_add_slice) di waktu ini karena level queue-nya berubah. */
 int priority_boost(ReadyQueue queues[], PCB *running, int time) {
-    boost_trigger_count++;
-
     for (int level = 1; level < NUM_QUEUES; level++) {
         PCB *p;
         while ((p = queue_dequeue(&queues[level])) != NULL) {
-            record_boost_migration(p, level, time);
+            record_boost(p, level, time);
             mlfq_make_ready(queues, p, 0, time);
         }
     }
 
     if (running != NULL && running->queue_level > 0) {
-        record_boost_migration(running, running->queue_level, time);
+        record_boost(running, running->queue_level, time);
         running->queue_level = 0;
         record_process_state(running, time);  /* tercatat RUNNING Q0 */
         return 1;
@@ -536,107 +474,57 @@ int priority_boost(ReadyQueue queues[], PCB *running, int time) {
     return 0;
 }
 
-/* Output tambahan (opsional di soal): riwayat priority boost. */
+/* Output priority boost, sesuai format contoh di soal. */
 void print_priority_boosts(const MLFQConfig *cfg) {
     printf("%s\n", LINE);
-    printf("PRIORITY BOOST\n");
+    printf("PRIORITY BOOST (setiap %d time unit)\n", cfg->boost_interval);
     printf("%s\n", LINE);
 
-    if (cfg->boost_interval <= 0) {
-        printf("Priority boost tidak diaktifkan.\n");
-        printf("%s\n\n", LINE);
-        return;
-    }
-
-    printf("Boost interval : setiap %d time unit\n\n", cfg->boost_interval);
-
-    int moved = 0, last_time = -1;
-    for (int i = 0; i < migration_log_count; i++) {
-        if (!migration_logs[i].is_boost) {
-            continue;
-        }
+    for (int i = 0; i < boost_log_count; i++) {
         /* kelompokkan baris berdasarkan waktu boost */
-        if (migration_logs[i].time != last_time) {
-            printf("Priority Boost at t = %d\n", migration_logs[i].time);
-            last_time = migration_logs[i].time;
+        if (i == 0 || boost_logs[i].time != boost_logs[i - 1].time) {
+            printf("Priority Boost at t = %d\n", boost_logs[i].time);
         }
-        printf("  P%d : Q%d -> Q0\n", migration_logs[i].pid,
-               migration_logs[i].from_queue);
-        moved++;
+        printf("P%d : Q%d -> Q0\n", boost_logs[i].pid,
+               boost_logs[i].from_queue);
     }
-    if (moved == 0) {
-        printf("Tidak ada proses di Q1/Q2 saat boost terjadi.\n");
-    }
-    printf("\nBoost dipicu sebanyak : %d kali\n", boost_trigger_count);
-    printf("Total proses di-boost : %d\n", moved);
     printf("%s\n\n", LINE);
 }
 
-/* ============================================================
- * BAGIAN 5B - MENU INPUT + 5 SKENARIO TES
- * ============================================================ */
+/* ---------------- MENU INPUT + 5 SKENARIO ----------------
+ * Input dibaca dengan scanf. Yang dicek hanya batas nilai yang bisa
+ * membuat simulasi error:
+ *   - jumlah proses <= MAX_PROCESS : array processes tidak overflow
+ *   - AT >= 0                      : proses tidak pernah "datang" jika AT < 0
+ *   - BT >= 1                      : BT 0 membuat proses tidak pernah selesai
+ *   - quantum >= 1                 : quantum 0 berarti FCFS di program ini
+ * Jika scanf gagal membaca angka, program berhenti. */
 
-/* Baca satu baris. Program berhenti dengan rapi jika input habis (EOF). */
-static void read_line(char *buf, size_t size) {
-    if (fgets(buf, (int)size, stdin) == NULL) {
-        printf("\nInput berakhir. Program selesai.\n");
-        exit(EXIT_SUCCESS);
-    }
-    /* Jika baris lebih panjang dari buffer, buang sisanya supaya tidak
-     * terbaca sebagai jawaban untuk pertanyaan berikutnya. */
-    if (strchr(buf, '\n') == NULL) {
-        int c;
-        while ((c = getchar()) != '\n' && c != EOF) {
-        }
-    }
-}
-
-/* Baca satu bilangan bulat dalam rentang [min, max], ulangi jika salah. */
+/* Baca satu bilangan bulat dalam rentang [min, max], ulangi jika di luar. */
 static int read_int_range(const char *prompt, int min, int max) {
-    char buf[128];
     int value;
-    char extra;
     while (1) {
         printf("%s", prompt);
-        fflush(stdout);
-        read_line(buf, sizeof buf);
-        if (sscanf(buf, "%d %c", &value, &extra) == 1 &&
-            value >= min && value <= max) {
+        if (scanf("%d", &value) != 1) {
+            printf("\nInput harus berupa angka. Program berhenti.\n");
+            exit(EXIT_FAILURE);
+        }
+        if (value >= min && value <= max) {
             return value;
         }
-        printf("  Input tidak valid. Masukkan bilangan bulat %d..%d.\n",
-               min, max);
+        printf("  Nilai harus di antara %d dan %d.\n", min, max);
     }
 }
 
-/* Baca Arrival Time dan Burst Time dalam satu baris, contoh: "0 8". */
-static void read_at_bt(int pid, int *at, int *bt) {
-    char buf[128];
-    char extra;
-    while (1) {
-        printf("P%d - masukkan Arrival Time dan Burst Time: ", pid);
-        fflush(stdout);
-        read_line(buf, sizeof buf);
-        if (sscanf(buf, "%d %d %c", at, bt, &extra) == 2 &&
-            *at >= 0 && *at <= MAX_ARRIVAL &&
-            *bt >= 1 && *bt <= MAX_BURST) {
-            return;
-        }
-        printf("  Input tidak valid. AT: 0..%d, BT: 1..%d (pisahkan spasi).\n",
-               MAX_ARRIVAL, MAX_BURST);
-    }
-}
-
+/* Baca jawaban y/n. Spasi sebelum %c melewati Enter sisa input sebelumnya. */
 static int read_yes_no(const char *prompt) {
-    char buf[128];
-    while (1) {
-        printf("%s", prompt);
-        fflush(stdout);
-        read_line(buf, sizeof buf);
-        if (buf[0] == 'y' || buf[0] == 'Y') return 1;
-        if (buf[0] == 'n' || buf[0] == 'N') return 0;
-        printf("  Jawab dengan y atau n.\n");
+    char answer;
+    printf("%s", prompt);
+    if (scanf(" %c", &answer) != 1) {
+        printf("\nInput berakhir. Program berhenti.\n");
+        exit(EXIT_FAILURE);
     }
+    return answer == 'y' || answer == 'Y';
 }
 
 /* Isi PCB dengan nilai awal. first_start_time = -1 artinya
@@ -650,25 +538,11 @@ static void init_pcb(PCB *p, int pid, int arrival, int burst) {
     p->queue_level = 0;         /* semua proses baru masuk Q0 */
     p->state = NEW;
     p->first_start_time = -1;
-    p->completion_time = -1;
-}
-
-static void read_config(MLFQConfig *cfg) {
-    cfg->quantum[0] = read_int_range("Quantum Q0 (RR, > 0): ", 1, MAX_QUANTUM);
-    cfg->quantum[1] = read_int_range("Quantum Q1 (RR, > 0): ", 1, MAX_QUANTUM);
-    cfg->quantum[2] = 0;  /* Q2 = FCFS */
-    if (read_yes_no("Aktifkan priority boost? (y/n): ")) {
-        cfg->boost_interval =
-            read_int_range("Boost setiap berapa time unit (>= 10): ", MIN_BOOST, 1000);
-    } else {
-        cfg->boost_interval = 0;
-    }
 }
 
 /* Data skenario yang di-hardcode. Semua data dibuat sendiri. */
 typedef struct {
     const char *name;
-    const char *purpose;
     int n;
     int arrival[MAX_PROCESS];
     int burst[MAX_PROCESS];
@@ -678,43 +552,33 @@ typedef struct {
 } TestScenario;
 
 static const TestScenario SCENARIOS[] = {
-    {
-        "Skenario 1 - Kondisi Normal",
-        "5 proses, AT berdekatan dan BT tidak ekstrem.",
-        5,
+    {   /* 5 proses, AT berdekatan dan BT tidak ekstrem */
+        "Skenario 1 - Kondisi Normal", 5,
         {0, 1, 2, 4, 5},
         {6, 4, 7, 3, 5},
         2, 4, 0
     },
-    {
-        "Skenario 2 - Arrival Time Berbeda (ada CPU idle)",
-        "Proses datang tersebar; ada CPU idle dan preemption antarqueue.",
-        5,
+    {   /* proses datang tersebar: ada CPU idle dan preemption antarqueue */
+        "Skenario 2 - Arrival Time Berbeda", 5,
         {0, 5, 6, 11, 20},
         {3, 6, 2, 4, 3},
         2, 4, 0
     },
-    {
-        "Skenario 3 - Burst Time Berbeda Signifikan (+ priority boost)",
-        "BT sangat besar dan sangat kecil dalam satu set; boost tiap 20.",
-        6,
+    {   /* BT sangat besar dan sangat kecil dalam satu set; boost tiap 20 */
+        "Skenario 3 - Burst Time Berbeda Signifikan", 6,
         {0, 1, 2, 3, 5, 12},
         {30, 2, 1, 18, 3, 1},
         2, 4, 20
     },
-    {
-        "Skenario 4 - Banyak Proses",
-        "12 proses sekaligus untuk menguji kestabilan linked list.",
-        12,
+    {   /* 12 proses sekaligus */
+        "Skenario 4 - Banyak Proses", 12,
         {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11},
         {5, 3, 8, 2, 6, 4, 1, 7, 3, 5, 2, 9},
         2, 4, 0
     },
-    {
-        "Skenario 5 - Edge Case",
-        "AT semua 0; BT sama (P2,P3,P5); BT = quantum Q0 (P1); "
-        "BT = Q0+Q1 (P2,P3,P5); BT sangat kecil (P4) & sangat besar (P6).",
-        6,
+    {   /* AT semua 0; BT sama (P2,P3,P5); BT = quantum Q0 (P1);
+         * BT = Q0+Q1 (P2,P3,P5); BT sangat kecil (P4) & sangat besar (P6) */
+        "Skenario 5 - Edge Case", 6,
         {0, 0, 0, 0, 0, 0},
         {2, 6, 6, 1, 6, 40},
         2, 4, 0
@@ -722,19 +586,44 @@ static const TestScenario SCENARIOS[] = {
 };
 #define NUM_SCENARIOS ((int)(sizeof SCENARIOS / sizeof SCENARIOS[0]))
 
-/* Contoh dari dokumen soal, hanya untuk mencocokkan output program. */
-static const TestScenario EXAMPLE_FROM_DOC = {
-    "Contoh dari dokumen soal (verifikasi)",
-    "Hasil harus sama dengan contoh output MLFQ di soal.",
-    4,
-    {0, 1, 2, 3},
-    {8, 4, 2, 5},
-    2, 3, 0
-};
+/* Input manual: jumlah proses, quantum, boost, lalu AT dan BT tiap proses. */
+static int input_manual(PCB processes[], MLFQConfig *cfg) {
+    int n = read_int_range("Jumlah proses: ", 1, MAX_PROCESS);
 
+    cfg->quantum[0] = read_int_range("Quantum Q0 (RR, > 0): ", 1, MAX_QUANTUM);
+    cfg->quantum[1] = read_int_range("Quantum Q1 (RR, > 0): ", 1, MAX_QUANTUM);
+    cfg->quantum[2] = 0;  /* Q2 = FCFS */
+
+    if (read_yes_no("Aktifkan priority boost? (y/n): ")) {
+        cfg->boost_interval = read_int_range(
+            "Boost setiap berapa time unit (>= 10): ", MIN_BOOST, 1000);
+    } else {
+        cfg->boost_interval = 0;
+    }
+
+    for (int i = 0; i < n; i++) {
+        int at, bt;
+        while (1) {
+            printf("P%d - masukkan Arrival Time dan Burst Time: ", i + 1);
+            if (scanf("%d %d", &at, &bt) != 2) {
+                printf("\nInput harus berupa angka. Program berhenti.\n");
+                exit(EXIT_FAILURE);
+            }
+            if (at >= 0 && at <= MAX_ARRIVAL && bt >= 1 && bt <= MAX_BURST) {
+                break;
+            }
+            printf("  AT harus 0..%d dan BT harus 1..%d.\n",
+                   MAX_ARRIVAL, MAX_BURST);
+        }
+        init_pcb(&processes[i], i + 1, at, bt);
+    }
+    return n;
+}
+
+/* Muat data proses dan konfigurasi dari skenario yang dipilih. */
 static int load_scenario(const TestScenario *s, PCB processes[],
                          MLFQConfig *cfg) {
-    printf("\n>> %s\n   %s\n", s->name, s->purpose);
+    printf("\n>> %s\n", s->name);
     for (int i = 0; i < s->n; i++) {
         init_pcb(&processes[i], i + 1, s->arrival[i], s->burst[i]);
     }
@@ -742,58 +631,30 @@ static int load_scenario(const TestScenario *s, PCB processes[],
     cfg->quantum[1] = s->quantum1;
     cfg->quantum[2] = 0;
     cfg->boost_interval = s->boost_interval;
-
-    printf("   Konfigurasi default: Q0 q=%d, Q1 q=%d, boost=",
-           cfg->quantum[0], cfg->quantum[1]);
-    if (cfg->boost_interval > 0) {
-        printf("tiap %d\n", cfg->boost_interval);
-    } else {
-        printf("mati\n");
-    }
-    if (!read_yes_no("Pakai konfigurasi default? (y/n): ")) {
-        read_config(cfg);
-    }
     return s->n;
 }
 
 /* Menu utama. Mengisi processes[] dan cfg.
- * Return jumlah proses, atau 0 jika user memilih keluar.
- * *trace = 1 jika user ingin melihat isi queue setiap dispatch. */
-int input_menu(PCB processes[], MLFQConfig *cfg, int *trace) {
-    int n;
+ * Return jumlah proses, atau 0 jika user memilih keluar. */
+int input_menu(PCB processes[], MLFQConfig *cfg) {
 
     printf("\n%s\n", LINE);
     printf("MULTILEVEL FEEDBACK QUEUE SCHEDULER\n");
-    printf("Q0: Round Robin | Q1: Round Robin | Q2: FCFS\n");
     printf("%s\n", LINE);
     printf("1. Input manual\n");
     for (int i = 0; i < NUM_SCENARIOS; i++) {
         printf("%d. %s\n", i + 2, SCENARIOS[i].name);
     }
-    printf("%d. %s\n", NUM_SCENARIOS + 2, EXAMPLE_FROM_DOC.name);
     printf("0. Keluar\n");
 
-    int choice = read_int_range("Pilih menu: ", 0, NUM_SCENARIOS + 2);
-
+    int choice = read_int_range("Pilih menu: ", 0, NUM_SCENARIOS + 1);
     if (choice == 0) {
         return 0;
-    } else if (choice == 1) {
-        n = read_int_range("Jumlah proses: ", 1, MAX_PROCESS);
-        read_config(cfg);
-        for (int i = 0; i < n; i++) {
-            int at, bt;
-            read_at_bt(i + 1, &at, &bt);
-            init_pcb(&processes[i], i + 1, at, bt);
-        }
-    } else if (choice <= NUM_SCENARIOS + 1) {
-        n = load_scenario(&SCENARIOS[choice - 2], processes, cfg);
-    } else {
-        n = load_scenario(&EXAMPLE_FROM_DOC, processes, cfg);
     }
-
-    *trace = read_yes_no(
-        "Tampilkan isi queue (linked list) tiap scheduler memilih proses? (y/n): ");
-    return n;
+    if (choice == 1) {
+        return input_manual(processes, cfg);
+    }
+    return load_scenario(&SCENARIOS[choice - 2], processes, cfg);
 }
 
 /* BAGIAN 1 - PROCESS INPUT versi MLFQ: tampilkan input dan konfigurasi queue. */
@@ -818,6 +679,7 @@ void print_process_input(const PCB processes[], int n, const MLFQConfig *cfg) {
 }
 
 /* ============================================================
+ * bagian2_bagian6_gantt_contextswitch.c
  * Bagian: 2 - Gantt Chart / CPU Execution Timeline
  *          6 - Context Switch
  *
@@ -838,12 +700,12 @@ void print_process_input(const PCB processes[], int n, const MLFQConfig *cfg) {
  * ============================================================ */
 
 #define MAX_SLICES 2500   /* slice >= 1 time unit, total CPU time <= 20 x 100 */
-#define MAX_QUEUE_LEVEL 3
+#define MAX_QUEUE_LEVEL 3  
 
 
 typedef struct {
     int pid;
-    int queue_level;
+    int queue_level;   
     int start_time;
     int end_time;
 } ExecutionSlice;
@@ -954,22 +816,18 @@ void print_context_switch_info(ExecutionLog *log) {
     printf("\n");
 }
 
-/* ======================================================================
- * BAGIAN 3, 4, 5 - Scheduling Table, Rata-rata, CPU Util & Throughput
- * ====================================================================== */
-
 /* Hitung TAT, WT, RT lalu SIMPAN ke PCB.
  * Dipanggil sekali setelah simulasi selesai (semua proses TERMINATED). */
 void hitung_metrics(PCB p[], int n) {
     for (int i = 0; i < n; i++) {
         /* TAT = CT - AT */
-        p[i].turnaround_time = p[i].completion_time - p[i].arrival_time;
+        p[i].turnaround_time = p[i].completion_time - p[i].arrival_time;   
 
         /* WT  = TAT - BT */
-        p[i].waiting_time    = p[i].turnaround_time - p[i].burst_time;
-
+        p[i].waiting_time    = p[i].turnaround_time - p[i].burst_time;  
+        
         /* RT  = start - AT */
-        p[i].response_time   = p[i].first_start_time - p[i].arrival_time;
+        p[i].response_time   = p[i].first_start_time - p[i].arrival_time;  
     }
 }
 
@@ -1016,27 +874,107 @@ void print_util_throughput(PCB p[], int n) {
     printf("Throughput      : %.2f process/time unit\n\n", (double)n / total);
 }
 
-/* ======================================================================
- * LOOP SCHEDULER MLFQ + main()  ->  dikerjakan Anggota 1
- *
- * Fungsi siap pakai dari bagian lain:
- *   input_menu(processes, &cfg, &trace)      -> n (0 = keluar)
- *   print_process_input(processes, n, &cfg)
- *   mlfq_init_queues(queues, &cfg)  reset_mlfq_logs()  reset_boost_logs()
- *   log_init(&log)
- *   mlfq_make_ready(queues, p, level, t)     -> state READY + enqueue + log
- *   mlfq_highest_ready(queues)               -> level tertinggi / -1
- *   queue_peek(&queues[lv])  queue_dequeue(&queues[lv])
- *   boost_due(&cfg, t)  priority_boost(queues, running, t)
- *   record_process_state()  record_queue_migration()
- *   record_higher_queue_preemption()  log_add_slice()
- *   mlfq_print_queues(queues, t)             -> jika trace aktif
- *   mlfq_free_queues(queues)                 -> di akhir simulasi
- *
- * Setelah simulasi: hitung_metrics(), print_gantt_chart(),
- *   print_process_queue_movements(), print_queue_migrations(),
- *   print_priority_boosts() (jika boost aktif),
- *   print_higher_queue_preemptions(), print_scheduling_table(),
- *   print_averages(), print_util_throughput(),
- *   print_context_switch_info(), print_process_state_transitions()
- * ====================================================================== */
+ int main(void) {
+    PCB processes[MAX_PROCESS];
+    MLFQConfig cfg;
+    ReadyQueue queues[NUM_QUEUES];
+    ExecutionLog log;
+
+    while (1) {
+        int n = input_menu(processes, &cfg);
+        if (n == 0) break;
+
+        print_process_input(processes, n, &cfg);
+        mlfq_init_queues(queues, &cfg);
+        reset_mlfq_logs();
+        reset_boost_logs();
+        log_init(&log);
+
+        int time = 0, done = 0;
+        PCB *running = NULL;
+        int slice_start = 0, quantum_used = 0;
+
+        while (done < n) {
+            /* 1. Priority boost (opsional) */
+            if (boost_due(&cfg, time)) {
+                int old_level = running ? running->queue_level : 0;
+                if (priority_boost(queues, running, time)) {
+                    log_add_slice(&log, running->pid, old_level, slice_start, time);
+                    slice_start = time;
+                    quantum_used = 0;
+                }
+            }
+
+            /* 2. Proses yang tiba pada waktu ini masuk ekor Q0 */
+            for (int i = 0; i < n; i++) {
+                if (processes[i].state == NEW && processes[i].arrival_time <= time) {
+                    mlfq_make_ready(queues, &processes[i], 0, time);
+                }
+            }
+
+            /* 3. Preemption oleh queue yang lebih tinggi */
+            int hi = mlfq_highest_ready(queues);
+            if (running != NULL && hi != -1 && hi < running->queue_level) {
+                record_higher_queue_preemption(running, queue_peek(&queues[hi]), time);
+                log_add_slice(&log, running->pid, running->queue_level, slice_start, time);
+                mlfq_make_ready(queues, running, running->queue_level, time);
+                running = NULL;
+            }
+
+            /* 4. Dispatch: ambil kepala queue tertinggi yang tidak kosong */
+            if (running == NULL) {
+                if (hi == -1) {          /* CPU idle */
+                    time++;
+                    continue;
+                }
+                running = queue_dequeue(&queues[hi]);
+                running->state = RUNNING;
+                if (running->first_start_time == -1) running->first_start_time = time;
+                record_process_state(running, time);
+                slice_start = time;
+                quantum_used = 0;
+            }
+
+            /* 5. Jalankan 1 time unit */
+            running->remaining_time--;
+            quantum_used++;
+            time++;
+
+            /* 6. Selesai atau quantum habis? */
+            if (running->remaining_time == 0) {
+                running->state = TERMINATED;
+                running->completion_time = time;
+                record_process_state(running, time);
+                log_add_slice(&log, running->pid, running->queue_level, slice_start, time);
+                done++;
+                running = NULL;
+            } else if (running->queue_level < NUM_QUEUES - 1 &&
+                       quantum_used >= cfg.quantum[running->queue_level]) {
+                int old_level = running->queue_level;
+                log_add_slice(&log, running->pid, old_level, slice_start, time);
+                record_queue_migration(running, old_level, old_level + 1, time);
+                running->queue_level = old_level + 1;
+                mlfq_make_ready(queues, running, running->queue_level, time);
+                running = NULL;
+            }
+        }
+
+        /* Output (urutan sama seperti contoh soal) */
+        hitung_metrics(processes, n);
+        print_gantt_chart(&log);
+        print_process_queue_movements(processes, n);
+        print_queue_migrations();
+        if (cfg.boost_interval > 0) print_priority_boosts(&cfg);
+        print_higher_queue_preemptions();
+        print_scheduling_table(processes, n);
+        print_averages(processes, n);
+        print_util_throughput(processes, n);
+        print_context_switch_info(&log);
+        print_process_state_transitions(processes, n);
+
+        mlfq_free_queues(queues);
+    }
+
+    printf("Program selesai.\n");
+    return 0;
+}
