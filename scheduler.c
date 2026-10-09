@@ -516,7 +516,7 @@ static int read_int_range(const char *prompt, int min, int max) {
     }
 }
 
-/* Baca jawaban y/n. Spasi sebelum %c melewati Enter sisa input sebelumnya. */
+/* Baca jawaban yes/no Spasi sebelum %c melewati Enter sisa input sebelumnya. */
 static int read_yes_no(const char *prompt) {
     char answer;
     printf("%s", prompt);
